@@ -1,6 +1,7 @@
 # Realtime Voice Q&A (OpenRouter + DeepSeek)
 
 A local, privacy-friendly voice assistant that turns microphone input into text answers.
+<img width="1920" height="1080" alt="image" src="https://github.com/user-attachments/assets/d11ceed9-b51d-442e-abbe-ba41bdb10c63" />
 
 Features
 - WebRTC mic capture with turn detection (VAD + energy fallback)
