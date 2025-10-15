@@ -6,6 +6,7 @@ from pathlib import Path
 
 import gradio as gr
 import numpy as np
+import requests
 from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, StreamingResponse
@@ -24,59 +25,73 @@ from scipy.signal import resample_poly
 from scipy.io.wavfile import write as wav_write
 from faster_whisper import WhisperModel
 
-# Gemini
-import google.generativeai as genai
-
 # ----------------------- Config -----------------------
 load_dotenv()
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") or "AIzaSyACxdgQK9bGCVJcP7s7Ge-3aaikrx_K-R8"
-if not GEMINI_API_KEY:
-    raise RuntimeError("GEMINI_API_KEY missing.")
-genai.configure(api_key=GEMINI_API_KEY)
+# Keys and model
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+if not OPENROUTER_API_KEY:
+    raise RuntimeError("OPENROUTER_API_KEY missing. Put it in .env as OPENROUTER_API_KEY=YOUR_KEY")
 
-def pick_gemini_model():
-    preferred = os.getenv("GEMINI_MODEL_NAME", "gemini-1.5-flash-latest")
-    candidates = [preferred, "gemini-1.5-flash-8b", "gemini-1.5-pro-latest", "gemini-1.0-pro"]
-    try:
-        models = list(genai.list_models())
-        supported = {
-            m.name.split("/")[-1]
-            for m in models
-            if getattr(m, "supported_generation_methods", None)
-            and "generateContent" in m.supported_generation_methods
-        }
-        for c in candidates:
-            if c in supported:
-                return c
-    except Exception:
-        pass
-    return candidates[0]
+# Free/low‑cost default that avoids “-latest”: change to deepseek/deepseek-r1 later if you want
+MODEL_ID = os.getenv("OPENROUTER_MODEL", "deepseek/deepseek-chat")
 
-GEMINI_MODEL_NAME = pick_gemini_model()
-gemini_model = genai.GenerativeModel(GEMINI_MODEL_NAME)
+# Controls
+USE_STREAM = os.getenv("USE_STREAM", "0") != "0"     # keep off first; SSE is optional
+REPLY_LANG = os.getenv("REPLY_LANG", "auto").lower() # auto|en|mr
+WHISPER_SIZE = os.getenv("WHISPER_SIZE", "tiny")
+ASR_TIMEOUT_S = float(os.getenv("ASR_TIMEOUT_S", "8"))
+DEBUG_SAVE = os.getenv("DEBUG_SAVE", "0") == "1"
 
-cur_dir = Path(__file__).parent
-
+# I/O and ASR params
 INPUT_SAMPLE_RATE = 24000
 OUTPUT_SAMPLE_RATE = 24000
 ASR_SAMPLE_RATE = 16000
-
 FRAME_MS = 30
 FRAME_SAMPLES_16K = int(ASR_SAMPLE_RATE * FRAME_MS / 1000)
 
-# VAD and energy fallback (permissive)
+# VAD thresholds (permissive)
 START_VOICE_FRAMES = 1
 END_SILENCE_FRAMES = 8
 
-WHISPER_SIZE = "small"
+# Load Whisper (CPU)
 whisper_model = WhisperModel(WHISPER_SIZE, device="cpu", compute_type="int8")
 
-USE_STREAM = os.getenv("USE_STREAM", "1") != "0"  # set USE_STREAM=0 to disable streaming
-REPLY_LANG = os.getenv("REPLY_LANG", "auto").lower()  # auto|en|mr
+# OpenRouter endpoint
+OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+OPENROUTER_HEADERS = {
+    "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+    "Content-Type": "application/json",
+    # These two are recommended by OpenRouter; customize if you host elsewhere
+    "HTTP-Referer": "http://localhost:7860",
+    "X-Title": "Realtime Mic Pipeline",
+}
 
+def call_openrouter(messages, temperature=0.3, stream=False, timeout=45):
+    """
+    Minimal non-streaming call to OpenRouter chat completions.
+    messages: [{"role":"system"/"user","content":"..."}]
+    """
+    payload = {
+        "model": MODEL_ID,
+        "messages": messages,
+        "temperature": temperature,
+        "stream": bool(stream),
+    }
+    resp = requests.post(OPENROUTER_URL, headers=OPENROUTER_HEADERS, json=payload, timeout=timeout)
+    if not resp.ok:
+        raise RuntimeError(f"HTTP {resp.status_code}: {resp.text[:500]}")
+    data = resp.json()
+    try:
+        return data["choices"][0]["message"]["content"].strip()
+    except Exception:
+        return ""
 
-class GeminiRealtimeTextHandler(AsyncStreamHandler):
+class OpenRouterRealtimeHandler(AsyncStreamHandler):
+    """
+    Mic in (24 kHz) -> 16 kHz -> VAD + energy fallback -> Whisper transcription ->
+    OpenRouter DeepSeek answer (text) -> chat UI.
+    """
     def __init__(self) -> None:
         super().__init__(
             expected_layout="mono",
@@ -85,7 +100,7 @@ class GeminiRealtimeTextHandler(AsyncStreamHandler):
         )
         self.output_queue = asyncio.Queue()
 
-        self.vad = webrtcvad.Vad(1)
+        self.vad = webrtcvad.Vad(1)  # permissive
         self.frame_residual = np.zeros(0, dtype=np.int16)
 
         self.in_speech = False
@@ -104,11 +119,11 @@ class GeminiRealtimeTextHandler(AsyncStreamHandler):
         self.debug = True
 
     def copy(self):
-        return GeminiRealtimeTextHandler()
+        return OpenRouterRealtimeHandler()
 
     async def start_up(self):
         await self.output_queue.put(
-            AdditionalOutputs({"role": "assistant", "content": f"Using Gemini model: {GEMINI_MODEL_NAME}"})
+            AdditionalOutputs({"role": "assistant", "content": f"Using OpenRouter model: {MODEL_ID}"})
         )
 
     def _to_16k_mono_int16(self, pcm24k: np.ndarray) -> np.ndarray:
@@ -167,64 +182,71 @@ class GeminiRealtimeTextHandler(AsyncStreamHandler):
         if self.debug:
             print(f"Finalizing turn with {len(speech16k)} samples")
 
-        # Emit progress
         await self.output_queue.put(
             AdditionalOutputs({"role": "assistant", "content": "Transcribing..."})
         )
 
-        # Transcribe
-        user_text = ""
+        # Write temp wav and transcribe with timeout
+        keep_file = DEBUG_SAVE
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+            wav_path = f.name
         try:
-            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
-                wav_path = f.name
+            wav_write(wav_path, ASR_SAMPLE_RATE, speech16k)
             try:
-                wav_write(wav_path, ASR_SAMPLE_RATE, speech16k)
-                user_text = await asyncio.to_thread(self._blocking_transcribe, wav_path)
-            finally:
+                user_text = await asyncio.wait_for(
+                    asyncio.to_thread(self._blocking_transcribe, wav_path),
+                    timeout=ASR_TIMEOUT_S,
+                )
+            except asyncio.TimeoutError:
+                user_text = ""
+                await self.output_queue.put(
+                    AdditionalOutputs({"role": "assistant", "content": "Transcribe timeout. Please speak a bit longer or closer to the mic."})
+                )
+            except Exception as e:
+                user_text = ""
+                await self.output_queue.put(
+                    AdditionalOutputs({"role": "assistant", "content": f"Transcribe error: {e}"})
+                )
+        finally:
+            if not keep_file:
                 try:
                     os.remove(wav_path)
                 except Exception:
                     pass
-        except Exception as e:
-            user_text = ""
-            await self.output_queue.put(
-                AdditionalOutputs({"role": "assistant", "content": f"Transcribe error: {e}"})
-            )
+            else:
+                await self.output_queue.put(
+                    AdditionalOutputs({"role": "assistant", "content": f"Saved last audio to: {wav_path}"})
+                )
 
-        # Show user's text (always)
+        # Always show what was heard
         await self.output_queue.put(
             AdditionalOutputs({"role": "user", "content": user_text or "[Unintelligible]"})
         )
 
-        # Build instruction
+        # Build prompt and system instruction
         if REPLY_LANG == "en":
             instr = "Answer concisely in English."
         elif REPLY_LANG == "mr":
             instr = "Answer concisely in Marathi."
         else:
             instr = "Answer concisely in the same language as the user."
-        prompt = f"{instr}\n\nUser said:\n{user_text or 'No recognizable speech.'}"
+        prompt = user_text or "No recognizable speech."
+        system_msg = instr
 
-        # Emit progress
         await self.output_queue.put(
-            AdditionalOutputs({"role": "assistant", "content": "Calling Gemini..."})
+            AdditionalOutputs({"role": "assistant", "content": "Calling OpenRouter..."})
         )
 
-        # Call Gemini
+        # Non-streaming call (more robust across networks)
         final_text = ""
         try:
-            if USE_STREAM:
-                stream = gemini_model.generate_content(prompt, stream=True)
-                buf = []
-                for chunk in stream:
-                    if hasattr(chunk, "text") and chunk.text:
-                        buf.append(chunk.text)
-                final_text = "".join(buf).strip() if buf else "No response text."
-            else:
-                resp = gemini_model.generate_content(prompt)
-                final_text = getattr(resp, "text", "") or "No response text."
+            messages = [
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": prompt},
+            ]
+            final_text = call_openrouter(messages, temperature=0.3, stream=False, timeout=45) or "No response text."
         except Exception as e:
-            final_text = f"Gemini error: {e}"
+            final_text = f"OpenRouter error: {e}"
 
         await self.output_queue.put(
             AdditionalOutputs({"role": "assistant", "content": final_text})
@@ -288,7 +310,7 @@ chatbot = gr.Chatbot(type="messages")
 latest_message = gr.Textbox(type="text", visible=False)
 
 stream = Stream(
-    GeminiRealtimeTextHandler(),
+    OpenRouterRealtimeHandler(),
     mode="send-receive",
     modality="audio",
     additional_inputs=[chatbot],
