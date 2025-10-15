@@ -32,13 +32,37 @@ import google.generativeai as genai
 # -------------------------------------------------
 load_dotenv()
 
-# Unsafe fallback: inlined key for quick run. Replace with env var ASAP.
+# Use .env if set; your inline key works for quick tests but rotate it later
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") or "AIzaSyACxdgQK9bGCVJcP7s7Ge-3aaikrx_K-R8"
 if not GEMINI_API_KEY:
     raise RuntimeError("GEMINI_API_KEY missing.")
-
 genai.configure(api_key=GEMINI_API_KEY)
-GEMINI_MODEL_NAME = "gemini-1.5-flash"
+
+def pick_gemini_model():
+    preferred = os.getenv("GEMINI_MODEL_NAME", "gemini-1.5-flash-latest")
+    candidates = [
+        preferred,
+        "gemini-1.5-flash-8b",
+        "gemini-1.5-pro-latest",
+        "gemini-1.0-pro",
+    ]
+    try:
+        models = list(genai.list_models())
+        supported = {
+            m.name.split("/")[-1]
+            for m in models
+            if getattr(m, "supported_generation_methods", None)
+            and "generateContent" in m.supported_generation_methods
+        }
+        for c in candidates:
+            if c in supported:
+                return c
+    except Exception:
+        pass
+    return candidates[0]
+
+GEMINI_MODEL_NAME = pick_gemini_model()
+gemini_model = genai.GenerativeModel(GEMINI_MODEL_NAME)
 
 cur_dir = Path(__file__).parent
 
@@ -50,20 +74,20 @@ OUTPUT_SAMPLE_RATE = 24000  # no audio out; text-only
 ASR_SAMPLE_RATE = 16000
 FRAME_MS = 30
 FRAME_SAMPLES_16K = int(ASR_SAMPLE_RATE * FRAME_MS / 1000)  # 480
-START_VOICE_FRAMES = 2      # ~60 ms
-END_SILENCE_FRAMES = 12     # ~360 ms
+
+# VAD thresholds (more permissive)
+START_VOICE_FRAMES = 1      # ~30 ms to start speech
+END_SILENCE_FRAMES = 8      # ~240 ms of silence to end speech
 
 # Whisper model (CPU). Options: "tiny", "base", "small", "medium"
 WHISPER_SIZE = "small"
 whisper_model = WhisperModel(WHISPER_SIZE, device="cpu", compute_type="int8")
 
-gemini_model = genai.GenerativeModel(GEMINI_MODEL_NAME)
-
 
 class GeminiRealtimeTextHandler(AsyncStreamHandler):
     """
-    Mic in (24 kHz) -> resample to 16 kHz -> VAD turn detection -> Whisper transcription ->
-    Gemini answer (text) -> stream to chat UI.
+    Mic in (24 kHz) -> resample to 16 kHz -> VAD + energy fallback -> Whisper transcription ->
+    Gemini answer (text) -> push to chat UI.
     """
     def __init__(self) -> None:
         super().__init__(
@@ -73,7 +97,8 @@ class GeminiRealtimeTextHandler(AsyncStreamHandler):
         )
         self.output_queue = asyncio.Queue()
 
-        self.vad = webrtcvad.Vad(2)  # 0..3
+        # More permissive VAD
+        self.vad = webrtcvad.Vad(1)  # 0..3 (lower = less strict)
         self.frame_residual = np.zeros(0, dtype=np.int16)
 
         self.in_speech = False
@@ -83,12 +108,24 @@ class GeminiRealtimeTextHandler(AsyncStreamHandler):
 
         self.turn_lock = asyncio.Lock()
 
+        # Energy fallback state
+        self.noise_floor = 300.0  # conservative initial RMS
+        self.min_energy_thr = 300.0  # absolute minimum RMS threshold
+        self.energy_multiplier = 2.5  # how far above noise_floor counts as speech
+
+        # Optional: cap each turn (e.g., 15 s) to ensure a response
+        self.max_frames_per_turn = int((15_000 / FRAME_MS))  # 15s at 30ms/frame
+
+        # Debug
+        self.debug = True
+
     def copy(self):
         return GeminiRealtimeTextHandler()
 
     async def start_up(self):
-        # No remote realtime socket needed (local VAD + ASR)
-        pass
+        await self.output_queue.put(
+            AdditionalOutputs({"role": "assistant", "content": f"Using Gemini model: {GEMINI_MODEL_NAME}"})
+        )
 
     def _to_16k_mono_int16(self, pcm24k: np.ndarray) -> np.ndarray:
         if pcm24k.ndim > 1:
@@ -115,6 +152,27 @@ class GeminiRealtimeTextHandler(AsyncStreamHandler):
         self.silence_frames = 0
         self.current_speech = []
 
+    def _rms(self, x: np.ndarray) -> float:
+        x = x.astype(np.float32)
+        return float(np.sqrt(np.mean(x * x)) + 1e-6)
+
+    def _is_speech(self, frame_bytes: bytes, frame_i16: np.ndarray) -> bool:
+        # WebRTC VAD decision
+        vad_flag = self.vad.is_speech(frame_bytes, ASR_SAMPLE_RATE)
+
+        # Energy fallback with adaptive noise floor
+        rms = self._rms(frame_i16)
+        # Exponential moving average for noise floor
+        alpha = 0.98 if not self.in_speech else 0.995  # track slower during speech
+        self.noise_floor = alpha * self.noise_floor + (1 - alpha) * rms
+        dynamic_thr = max(self.min_energy_thr, self.noise_floor * self.energy_multiplier)
+        energy_flag = rms > dynamic_thr
+
+        if self.debug:
+            print(f"VAD={vad_flag} RMS={rms:.1f} floor={self.noise_floor:.1f} thr={dynamic_thr:.1f}")
+
+        return vad_flag or energy_flag
+
     def _blocking_transcribe(self, wav_path: str) -> str:
         segments, _ = whisper_model.transcribe(
             wav_path,
@@ -129,6 +187,9 @@ class GeminiRealtimeTextHandler(AsyncStreamHandler):
         return " ".join(parts).strip()
 
     async def _finalize_turn_and_respond(self, speech16k: np.ndarray):
+        if self.debug:
+            print(f"Finalizing turn with {len(speech16k)} samples")
+
         # Write temp WAV for Whisper
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
             wav_path = f.name
@@ -141,30 +202,40 @@ class GeminiRealtimeTextHandler(AsyncStreamHandler):
             except Exception:
                 pass
 
-        # Emit user's text
         await self.output_queue.put(
             AdditionalOutputs({"role": "user", "content": user_text or "[Unintelligible]"})
         )
 
-        # Ask Gemini (streaming iterator, not async)
-        prompt = f"Answer concisely in the same language as the user.\n\nUser said:\n{user_text or 'No recognizable speech.'}"
-        stream = gemini_model.generate_content(prompt, stream=True)
+        # Build instruction
+        lang = os.getenv("REPLY_LANG", "auto").lower()  # auto|en|mr
+        if lang == "en":
+            instr = "Answer concisely in English."
+        elif lang == "mr":
+            instr = "Answer concisely in Marathi."
+        else:
+            instr = "Answer concisely in the same language as the user."
+        prompt = f"{instr}\n\nUser said:\n{user_text or 'No recognizable speech.'}"
 
-        buf = []
-        for chunk in stream:
-            if hasattr(chunk, "text") and chunk.text:
-                buf.append(chunk.text)
-                # For partial streaming, emit here, but it will append many partials:
-                # await self.output_queue.put(AdditionalOutputs({"role": "assistant", "content": "".join(buf)}))
+        # Stream from Gemini (iterator)
+        try:
+            stream = gemini_model.generate_content(prompt, stream=True)
+            buf = []
+            for chunk in stream:
+                if hasattr(chunk, "text") and chunk.text:
+                    buf.append(chunk.text)
+            final_text = "".join(buf).strip() if buf else "No response text."
+        except Exception as e:
+            final_text = f"Gemini error: {e}"
 
-        final_text = "".join(buf).strip() if buf else "No response text."
         await self.output_queue.put(
             AdditionalOutputs({"role": "assistant", "content": final_text})
         )
 
     async def _process_turn(self, speech16k: np.ndarray):
         async with self.turn_lock:
-            if speech16k.size < FRAME_SAMPLES_16K * 4:  # very short
+            if speech16k.size < FRAME_SAMPLES_16K * 4:  # ignore very short utterances
+                if self.debug:
+                    print("Turn discarded: too short")
                 return
             await self._finalize_turn_and_respond(speech16k)
 
@@ -180,7 +251,7 @@ class GeminiRealtimeTextHandler(AsyncStreamHandler):
             self.frame_residual = np.zeros(0, dtype=np.int16)
 
         for frame_bytes, frame_i16 in self._frames_30ms(pcm16k):
-            is_speech = self.vad.is_speech(frame_bytes, ASR_SAMPLE_RATE)
+            is_speech = self._is_speech(frame_bytes, frame_i16)
 
             if is_speech:
                 self.voiced_frames += 1
@@ -188,11 +259,15 @@ class GeminiRealtimeTextHandler(AsyncStreamHandler):
                 self.current_speech.append(frame_i16)
                 if not self.in_speech and self.voiced_frames >= START_VOICE_FRAMES:
                     self.in_speech = True
+                    if self.debug:
+                        print("Speech START")
             else:
                 if self.in_speech:
                     self.silence_frames += 1
                     self.current_speech.append(frame_i16)
-                    if self.silence_frames >= END_SILENCE_FRAMES:
+                    if self.silence_frames >= END_SILENCE_FRAMES or len(self.current_speech) >= self.max_frames_per_turn:
+                        if self.debug:
+                            print("Speech END")
                         speech = (
                             np.concatenate(self.current_speech)
                             if self.current_speech
@@ -238,7 +313,6 @@ stream.mount(app)
 
 @app.get("/")
 async def _():
-    # Built-in UI is recommended (MODE=UI). This route is a simple notice.
     html = "<html><body><h3>Start with MODE=UI and open the Gradio link in console.</h3></body></html>"
     return HTMLResponse(content=html)
 
